@@ -26,11 +26,16 @@ import os
 import re
 import sys
 import time
+import http.client
+import socket
+import ssl
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib.parse import quote
 
 import requests
+from requests.adapters import HTTPAdapter
 
 # 保证日志在任何控制台编码下都能输出 (Windows GBK 控制台不会崩)
 for _stream in (sys.stdout, sys.stderr):
@@ -51,13 +56,37 @@ VPNGATE_MIRROR = os.environ.get(
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
 )
 # 已部署的 Cloudflare Worker 检测接口 (GET /check?proxyip=host:port, 实测确认)
-WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://worer.3418013863.workers.dev/check?sstp=vpn:vpn@")
+_DEFAULT_CHECK_WORKER = "https://worer.3418013863.workers.dev/check?sstp=vpn:vpn@"
+# 支持 CHECK_WORKER / WORKER_CHECK_URL 两种变量名; "已设置但为空"也回退到默认值
+# (os.environ.get 在变量存在但为空串时不会用默认值, 这会让检测全部失败)
+WORKER_CHECK_URL = (
+    os.environ.get("CHECK_WORKER") or os.environ.get("WORKER_CHECK_URL") or ""
+).strip() or _DEFAULT_CHECK_WORKER
+# 只填了域名/基址时自动补全检测路径
+if "?" not in WORKER_CHECK_URL:
+    WORKER_CHECK_URL = f"{WORKER_CHECK_URL.rstrip('/')}/check?sstp=vpn:vpn@"
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))   # 与 Worker 网页端一致的并发模型
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))          # 单请求客户端超时 (秒)
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))         # 0=不限; 本地测试可设小值
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))              # 拉取数据源超时
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
+
+# 本站 Pages 基址: 生成文件里显示的"固定地址" (原来是模板作者的 jerylihub.github.io, 已改成本仓库)
+PAGES_BASE = os.environ.get("PAGES_BASE", "https://dagou78.github.io/vpn-gate-node-check").rstrip("/")
+
+# 刷新周期说明: GitHub Actions 的 schedule 在高频下会被合并或直接丢弃 ——
+# cron 写 */30, 实测实际间隔约 4-8 小时。所以这里不要写死"每 30 分钟"。
+REFRESH_HINT = os.environ.get(
+    "REFRESH_HINT",
+    "GitHub Actions 定时任务, 实际间隔约 4-8 小时, 以本文件生成时间为准",
+)
+
+# 入口优选 IP 源 (bestcf 地区文件, 格式 IP:PORT#备注)
+EDGE_POOL_BASE = os.environ.get("EDGE_POOL_BASE", "https://bestcf.pages.dev/tiancheng").rstrip("/")
+EDGE_POOL_REGIONS = [r.strip().lower() for r in os.environ.get("EDGE_POOL_REGIONS", "kr,jp,sg").split(",") if r.strip()]
+EDGE_PROBE_TIMEOUT = float(os.environ.get("EDGE_PROBE_TIMEOUT", "8"))
+EDGE_PROBE_WORKERS = max(1, int(os.environ.get("EDGE_PROBE_WORKERS", "8")))
 
 # 出口数据中心的关键词启发 (判断"是否住宅 IP"用, 页面标注为估算)
 DATA_CENTER_ORG_KEYWORDS = [
@@ -307,7 +336,24 @@ def classify_network(host, exit_org, is_datacenter=None):
     return "unknown"
 
 
-def check_one(node, session):
+_thread_local = threading.local()
+
+
+def get_session():
+    """每线程一个 Session。
+    requests.Session 不是线程安全的: 32 个线程共享同一个 Session 会因 urllib3 连接池竞争
+    导致检测结果随机误判, 所以改成 thread-local + 显式连接池大小。"""
+    sess = getattr(_thread_local, "session", None)
+    if sess is None:
+        sess = requests.Session()
+        adapter = HTTPAdapter(pool_connections=4, pool_maxsize=8, pool_block=False, max_retries=0)
+        sess.mount("https://", adapter)
+        sess.mount("http://", adapter)
+        _thread_local.session = sess
+    return sess
+
+
+def check_one(node):
     """调用 Worker 检测单节点。返回节点+检测结果的合并 dict。
     单节点失败 (网络错误/非 200/坏 JSON) 不会抛出, 统一记 success=False。"""
     url = WORKER_CHECK_URL + quote(f"{node['host']}:{node['port']}", safe="")
@@ -319,7 +365,7 @@ def check_one(node, session):
     out["exit"] = None
     out["residential"] = "unknown"
     try:
-        r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
+        r = get_session().get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
         if r.status_code != 200:
             out["error"] = f"HTTP {r.status_code}"
             out["worker_error"] = True
@@ -357,11 +403,11 @@ def check_one(node, session):
         return out
 
 
-def check_all(nodes, session):
+def check_all(nodes):
     """32 并发 (与网页端一致)。单节点失败不影响整体; 但区分'节点不可用'与'Worker 异常'。"""
     results = []
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        futures = [pool.submit(check_one, n, session) for n in nodes]
+        futures = [pool.submit(check_one, n) for n in nodes]
         for fut in as_completed(futures):
             results.append(fut.result())
     return results
@@ -407,21 +453,21 @@ def build_outputs(results, raw_count, sstp_count, source):
     return data
 
 
-CHAIN_URL = os.environ.get("CHAIN_URL", "https://jerylihub.github.io/gate/chains.txt")
+CHAIN_URL = os.environ.get("CHAIN_URL", f"{PAGES_BASE}/chains.txt")
 
 
 def build_chains_text(data):
     """生成 edgetunnel 链式代理清单: 按国家分组, 每国编号固定, 住宅优先, 延迟升序。
-    每行 = 「名字 + $sstp://vpn:vpn@host:port」, 名字不变, 指令每 30 分钟自动换。"""
+    每行 = 「名字 + $sstp://vpn:vpn@host:port」, 名字不变, 指令会自动轮换。"""
     countries = data["countries"]
     lines = [
         "# VPN Gate SSTP 节点 -> edgetunnel 链式代理清单",
-        f"# 自动更新: {data['generated_at']} (每 30 分钟重新检测)",
+        f"# 生成时间: {data['generated_at']} ({REFRESH_HINT})",
         f"# 固定地址: {CHAIN_URL}",
         "#",
         "# 用法: 在 edgetunnel 节点备注里直接粘贴下面任意一行 (名字与指令连写)",
         "#   例: 日本-住宅-01$sstp://vpn:vpn@vpnxxx.opengw.net:443",
-        "# 名字保持不变, 只有 $sstp:// 后面的地址每 30 分钟自动更换",
+        "# 名字保持不变, 只有 $sstp:// 后面的地址会自动更换 (以生成时间为准)",
         "# 账号密码固定 vpn:vpn ; 端口必须保留",
         "# ========================================================",
     ]
@@ -465,18 +511,133 @@ EDGE_HOSTS = [
     if h.strip()
 ]
 
-HOSTS_URL = os.environ.get("HOSTS_URL", "https://jerylihub.github.io/gate/hosts.txt")
+HOSTS_URL = os.environ.get("HOSTS_URL", f"{PAGES_BASE}/hosts.txt")
+
+
+# ---------------------------------------------------------------------------
+# 入口优选 IP: 拉取 -> 端到端探测 -> 只保留真正能连通的入口
+# ---------------------------------------------------------------------------
+# 为什么不能只做 TCP 探测: 实测存在 "TCP 25ms 就通, 但 TLS 证书不受信" 的假入口,
+# 写进 hosts.txt 后客户端照样连不上。所以这里做完整的 HTTPS + 正确 SNI/Host 探测,
+# 等价于:  curl --resolve <EDT_DOMAIN>:<port>:<ip> https://<EDT_DOMAIN>/
+class _SniHTTPSConnection(http.client.HTTPSConnection):
+    """用 IP 建 TCP 连接, 但 TLS SNI 用节点域名 —— 否则 Cloudflare / 反代无法路由到正确站点。"""
+
+    def __init__(self, ip, port, sni, timeout):
+        super().__init__(ip, port, timeout=timeout, context=ssl.create_default_context())
+        self._sni = sni
+
+    def connect(self):
+        sock = socket.create_connection((self.host, self.port), self.timeout)
+        self.sock = self._context.wrap_socket(sock, server_hostname=self._sni)
+
+
+def fetch_edge_candidates():
+    """从 bestcf 地区文件拉候选入口 (格式 IP:PORT#备注), 返回去重后的 IP:PORT 列表。"""
+    candidates = []
+    for region in EDGE_POOL_REGIONS:
+        url = f"{EDGE_POOL_BASE}/{region}.txt"
+        try:
+            resp = requests.get(url, timeout=HTTP_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
+            resp.raise_for_status()
+        except Exception as exc:
+            log("EDGE POOL", f"  {region}: 拉取失败 {type(exc).__name__}: {exc}")
+            continue
+        got = 0
+        for line in resp.text.splitlines():
+            token = line.split("#")[0].strip()          # 关键: 剥掉 bestcf 的 #备注, 只留 IP:PORT
+            if not re.match(r"^\d{1,3}(\.\d{1,3}){3}:\d{1,5}$", token):
+                continue
+            port = int(token.rsplit(":", 1)[1])
+            if not (1 <= port <= 65535):
+                continue
+            if token not in candidates:
+                candidates.append(token)
+                got += 1
+        log("EDGE POOL", f"  {region}: 候选 {got} 个")
+    return candidates
+
+
+def probe_entry(entry, host):
+    """端到端探测单个入口。返回 (是否可用, 延迟ms, 错误信息)。"""
+    started = time.time()
+    conn = None
+    try:
+        ip, port = entry.rsplit(":", 1)
+        conn = _SniHTTPSConnection(ip, int(port), host, EDGE_PROBE_TIMEOUT)
+        conn.request(
+            "GET", "/",
+            headers={"Host": host, "User-Agent": "Mozilla/5.0 (gate-checker)", "Connection": "close"},
+        )
+        resp = conn.getresponse()
+        resp.read(512)
+        elapsed = int((time.time() - started) * 1000)
+        if 200 <= resp.status < 400:
+            return True, elapsed, None
+        return False, elapsed, f"HTTP {resp.status}"
+    except Exception as exc:
+        return False, int((time.time() - started) * 1000), f"{type(exc).__name__}: {exc}"
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+def build_edge_pool(host):
+    """构造入口池: HOSTS_ENTRY 覆盖 > bestcf 地区文件 > 内置 EDGE_HOSTS。
+    全部做端到端探测, 只返回可用入口 (按延迟升序)。"""
+    manual = os.environ.get("HOSTS_ENTRY", "").strip()
+    if manual:
+        candidates = [e.strip() for e in manual.split(",") if e.strip()]
+        log("EDGE POOL", f"使用 HOSTS_ENTRY 指定的 {len(candidates)} 个入口 (跳过联网拉取)")
+    else:
+        candidates = fetch_edge_candidates()
+        if not candidates:
+            log("EDGE POOL", f"优选源不可用, 回退到内置 EDGE_HOSTS ({len(EDGE_HOSTS)} 个)")
+            candidates = list(EDGE_HOSTS)
+
+    if not candidates:
+        return []
+
+    alive = []
+    with ThreadPoolExecutor(max_workers=max(1, min(EDGE_PROBE_WORKERS, len(candidates)))) as pool:
+        futures = {pool.submit(probe_entry, e, host): e for e in candidates}
+        for fut in as_completed(futures):
+            entry = futures[fut]
+            ok, ms, err = fut.result()
+            if ok:
+                alive.append((ms, entry))
+            else:
+                log("EDGE POOL", f"  剔除 {entry}  ({err})")
+
+    alive.sort(key=lambda item: item[0])
+    log("EDGE POOL", f"探测完成: 可用 {len(alive)} / 候选 {len(candidates)}")
+    for ms, entry in alive:
+        log("EDGE POOL", f"  ✓ {entry}  {ms}ms")
+    return [entry for _, entry in alive]
 
 
 def build_hosts_text(data):
     """生成可直接粘贴到 edgetunnel 后台「自定义优选IP」框的清单。
-    每行 = 入口地址#名字$sstp://... ; 名字固定, 底下 SSTP 节点每 30 分钟自动换。"""
+    每行 = 入口地址#名字$sstp://... ; 名字固定, 底下 SSTP 节点会自动更换。"""
     countries = data["countries"]
-    # 入口: 默认用 7 个实测可用优选域名循环分配; 可用 HOSTS_ENTRY 覆盖(逗号分隔)
-    _entry = os.environ.get("HOSTS_ENTRY", "").strip()
-    edge = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS or [f"{EDT_DOMAIN}:443"]
+    # 入口: 优先用端到端探测通过的优选入口 (main() 把结果放进 data["edge_pool"])
+    edge = list(data.get("edge_pool") or [])
+    used_fallback = not edge
+    if used_fallback:
+        _entry = os.environ.get("HOSTS_ENTRY", "").strip()
+        edge = [e.strip() for e in _entry.split(",") if e.strip()] or list(EDGE_HOSTS) or [f"{EDT_DOMAIN}:443"]
     lines = []
     idx = 0
+    if used_fallback:
+        lines.append("# ⚠️ 本次未探测到可用优选入口, 下面用的是内置回退入口池 (可用率未知)")
+    else:
+        lines.append(
+            f"# 本次入口池 {len(edge)} 个 (已端到端探测, 延迟升序): "
+            + ", ".join(edge[:6]) + (" ..." if len(edge) > 6 else "")
+        )
     ordered = sorted(
         countries.items(),
         key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])),
@@ -514,7 +675,7 @@ def build_hosts_text(data):
 EDT_UUID = os.environ.get("EDT_UUID", "ac1a3ebb-d1d5-4eee-8a35-8f558fa3c008")
 EDT_DOMAIN = os.environ.get("EDT_DOMAIN", "cloud.dagou78.icu")
 EDT_FINGERPRINT = os.environ.get("EDT_FINGERPRINT", "chrome")
-SUB_URL = os.environ.get("SUB_URL", "https://jerylihub.github.io/gate/sub.txt")
+SUB_URL = os.environ.get("SUB_URL", f"{PAGES_BASE}/sub.txt")
 
 
 def _b64_secret_encode(plaintext, secret):
@@ -555,10 +716,10 @@ def build_sub_text(data):
     countries = data["countries"]
     lines = [
         "# edgetunnel 完整订阅 (vless://) —— 填进后台「订阅链接」URL",
-        f"# 自动更新: {data['generated_at']} (每 30 分钟重新检测)",
+        f"# 生成时间: {data['generated_at']} ({REFRESH_HINT})",
         f"# 固定地址: {SUB_URL}",
         f"# 节点域名: {EDT_DOMAIN} (传输 ws / TLS / fingerprint {EDT_FINGERPRINT})",
-        "# 名字固定; $sstp:// 链式代理(编码在 path)每 30 分钟自动更换",
+        "# 名字固定; $sstp:// 链式代理(编码在 path)会自动更换 (以生成时间为准)",
         "# 账号密码固定 vpn:vpn ; 节点端口已编码进 path",
         "# ========================================================",
     ]
@@ -632,8 +793,6 @@ def write_outputs(data):
 # main
 # ---------------------------------------------------------------------------
 def main():
-    session = requests.Session()
-
     # 1) 数据源
     rows, source = fetch_vpngate()
     raw_count = len(rows)
@@ -657,7 +816,7 @@ def main():
     # 3) 并发检测
     log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s)")
     t0 = time.time()
-    results = check_all(uniq, session)
+    results = check_all(uniq)
     elapsed = time.time() - t0
 
     success = [r for r in results if r.get("success")]
@@ -672,10 +831,21 @@ def main():
     if uniq and not success and len(worker_errors) == len(uniq):
         die("Worker 全部请求异常, 检测服务不可用 — 本次运行判定失败 (不生成空结果)")
 
-    # 4) 结果 + 网页
+    # 4) 入口优选 IP: 只保留端到端探测通过的入口
+    #    (只做 TCP 探测会误判: 实测有 "TCP 25ms 通, 但 TLS 证书不受信" 的假入口)
+    log("EDGE POOL", f"优选源: {EDGE_POOL_BASE}  地区: {','.join(EDGE_POOL_REGIONS) or '(无)'}")
+    edge_pool = build_edge_pool(EDT_DOMAIN)
+    if not edge_pool:
+        die("没有任何可用入口 — 生成的 hosts.txt 会全部连不上, 本次判定失败 (不生成假成功结果)")
+
+    # 5) 结果 + 网页
     data = build_outputs(results, raw_count, sstp_count, source)
+    data["edge_pool"] = edge_pool
+    data["refresh_hint"] = REFRESH_HINT
+    data["stats"]["edge_pool_size"] = len(edge_pool)
     log("RESULT", f"可用节点: {len(success)}")
     log("RESULT", f"国家数量: {data['stats']['countries']}")
+    log("RESULT", f"可用入口: {len(edge_pool)}")
 
     data_path, html_path, chains_path, hosts_path, sub_path = write_outputs(data)
     log("WEBSITE", f"生成 {os.path.relpath(data_path, REPO_DIR)}")
