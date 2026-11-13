@@ -43,10 +43,13 @@ jobs:
 
           # 入口优选 IP: 从 bestcf 地区文件拉候选, 端到端探测通过才写进 hosts.txt
           # (只做 TCP 探测会误判: 实测有 "TCP 25ms 通, 但 TLS 证书不受信" 的假入口)
+          # 实测存在的地区文件: kr jp sg us hk tw all (de/uk/fr/au/tr 是 404)
           EDGE_POOL_BASE: "https://bestcf.pages.dev/tiancheng"
-          EDGE_POOL_REGIONS: "kr,jp,sg"
-          EDGE_PROBE_TIMEOUT: "8"
-          EDGE_PROBE_WORKERS: "8"
+          EDGE_POOL_REGIONS: "kr,jp,sg,us,hk,tw,all"
+          EDGE_PROBE_TIMEOUT: "6"
+          EDGE_PROBE_WORKERS: "16"
+          # 探测保留数低于这个值就回退用 bestcf 原始列表 (探测跑在美国, 判断不了国内连通性)
+          EDGE_POOL_MIN_KEEP: "8"
 
           # 生成文件里显示的"固定地址"基址 (别再用模板作者的 jerylihub.github.io)
           PAGES_BASE: "https://dagou78.github.io/vpn-gate-node-check"
