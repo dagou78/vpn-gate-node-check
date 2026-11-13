@@ -92,10 +92,14 @@ EDGE_POOL_REGIONS = [
 ]
 EDGE_PROBE_TIMEOUT = float(os.environ.get("EDGE_PROBE_TIMEOUT", "6"))
 EDGE_PROBE_WORKERS = max(1, int(os.environ.get("EDGE_PROBE_WORKERS", "16")))
-# 探测后至少要保留多少个入口。低于这个数就回退用 bestcf 的原始列表 ——
-# 因为 bestcf 的列表本身是"从国内实测"出来的, 而入口探测是在 GitHub Actions(美国) 跑的,
-# 美国通不通和中国通不通是两回事, 不能因为美国探测失败就把国内可用的入口全丢掉。
+# 是否对入口做"端到端探测"。默认关闭 ——
+# 流水线跑在 GitHub Actions(美国), 从美国探测只能说明"美国通不通", 判断不了国内连通性,
+# 开着反而会误删国内可用的入口。bestcf 的列表本身就是从国内实测出来的, 直接信任即可。
+# 需要时设 EDGE_PROBE=1 打开 (此时 EDGE_POOL_MIN_KEEP 生效, 兜底防止筛太狠)。
+EDGE_PROBE = os.environ.get("EDGE_PROBE", "0").strip().lower() in ("1", "true", "yes", "on")
 EDGE_POOL_MIN_KEEP = max(1, int(os.environ.get("EDGE_POOL_MIN_KEEP", "8")))
+# 入口池上限, 0 = 不限
+EDGE_POOL_MAX = max(0, int(os.environ.get("EDGE_POOL_MAX", "0")))
 
 # 出口数据中心的关键词启发 (判断"是否住宅 IP"用, 页面标注为估算)
 DATA_CENTER_ORG_KEYWORDS = [
@@ -595,21 +599,40 @@ def probe_entry(entry, host):
 
 
 def build_edge_pool(host):
-    """构造入口池: HOSTS_ENTRY 覆盖 > bestcf 地区文件 > 内置 EDGE_HOSTS。
-    全部做端到端探测, 只返回可用入口 (按延迟升序)。"""
+    """构造入口池 —— 全自动, 不依赖任何本地文件。优先级:
+        1) HOSTS_ENTRY 环境变量 (可选的手动覆盖: 把你自己测出的前 N 个 IP 填进 check.yml 即可)
+        2) bestcf 各地区优选 IP 文件 (这些列表本身就是从国内实测出来的)
+        3) 内置 EDGE_HOSTS (兜底, 仅当在线源完全拉不到时)
+
+    默认不做探测, 理由见 EDGE_PROBE 的注释; 设 EDGE_PROBE=1 才做端到端探测。
+    """
     manual = os.environ.get("HOSTS_ENTRY", "").strip()
     if manual:
         candidates = [e.strip() for e in manual.split(",") if e.strip()]
-        log("EDGE POOL", f"使用 HOSTS_ENTRY 指定的 {len(candidates)} 个入口 (跳过联网拉取)")
+        log("EDGE POOL", f"使用 HOSTS_ENTRY 指定的 {len(candidates)} 个入口")
     else:
         candidates = fetch_edge_candidates()
         if not candidates:
-            log("EDGE POOL", f"优选源不可用, 回退到内置 EDGE_HOSTS ({len(EDGE_HOSTS)} 个)")
+            log("EDGE POOL", f"在线优选源不可用, 回退到内置 EDGE_HOSTS ({len(EDGE_HOSTS)} 个)")
             candidates = list(EDGE_HOSTS)
 
     if not candidates:
         return []
+    if EDGE_POOL_MAX > 0:
+        candidates = candidates[:EDGE_POOL_MAX]
 
+    if EDGE_PROBE:
+        return _probe_candidates(candidates, host)
+
+    log("EDGE POOL", f"入口池 {len(candidates)} 个 (bestcf 国内实测列表, 跳过美国侧探测)")
+    log("EDGE POOL", f"  示例: {', '.join(candidates[:6])}")
+    return list(candidates)
+
+
+def _probe_candidates(candidates, host):
+    """对候选入口逐个做端到端探测, 返回可用项 (延迟升序)。"""
+    if not candidates:
+        return []
     alive = []
     with ThreadPoolExecutor(max_workers=max(1, min(EDGE_PROBE_WORKERS, len(candidates)))) as pool:
         futures = {pool.submit(probe_entry, e, host): e for e in candidates}
@@ -627,11 +650,11 @@ def build_edge_pool(host):
         log("EDGE POOL", f"  ✓ {entry}  {ms}ms")
 
     if len(alive) < EDGE_POOL_MIN_KEEP:
-        # 探测是从美国发起的, 判断不了国内连通性, 所以不能把 bestcf(国内实测) 的入口全丢掉
+        # 探测是从美国发起的, 判断不了国内连通性, 所以不能把候选入口全丢掉
         log(
             "EDGE POOL",
             f"[警告] 探测只保留了 {len(alive)} 个 (< EDGE_POOL_MIN_KEEP={EDGE_POOL_MIN_KEEP}), "
-            f"回退使用 bestcf 原始候选 {len(candidates)} 个",
+            f"回退使用原始候选 {len(candidates)} 个",
         )
         return list(candidates)
 
