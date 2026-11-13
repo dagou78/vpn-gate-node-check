@@ -83,10 +83,19 @@ REFRESH_HINT = os.environ.get(
 )
 
 # 入口优选 IP 源 (bestcf 地区文件, 格式 IP:PORT#备注)
+# 实测存在的地区文件: kr jp sg us hk tw all  (de/uk/fr/au/tr 返回 404, 不存在)
 EDGE_POOL_BASE = os.environ.get("EDGE_POOL_BASE", "https://bestcf.pages.dev/tiancheng").rstrip("/")
-EDGE_POOL_REGIONS = [r.strip().lower() for r in os.environ.get("EDGE_POOL_REGIONS", "kr,jp,sg").split(",") if r.strip()]
-EDGE_PROBE_TIMEOUT = float(os.environ.get("EDGE_PROBE_TIMEOUT", "8"))
-EDGE_PROBE_WORKERS = max(1, int(os.environ.get("EDGE_PROBE_WORKERS", "8")))
+EDGE_POOL_REGIONS = [
+    r.strip().lower()
+    for r in os.environ.get("EDGE_POOL_REGIONS", "kr,jp,sg,us,hk,tw,all").split(",")
+    if r.strip()
+]
+EDGE_PROBE_TIMEOUT = float(os.environ.get("EDGE_PROBE_TIMEOUT", "6"))
+EDGE_PROBE_WORKERS = max(1, int(os.environ.get("EDGE_PROBE_WORKERS", "16")))
+# 探测后至少要保留多少个入口。低于这个数就回退用 bestcf 的原始列表 ——
+# 因为 bestcf 的列表本身是"从国内实测"出来的, 而入口探测是在 GitHub Actions(美国) 跑的,
+# 美国通不通和中国通不通是两回事, 不能因为美国探测失败就把国内可用的入口全丢掉。
+EDGE_POOL_MIN_KEEP = max(1, int(os.environ.get("EDGE_POOL_MIN_KEEP", "8")))
 
 # 出口数据中心的关键词启发 (判断"是否住宅 IP"用, 页面标注为估算)
 DATA_CENTER_ORG_KEYWORDS = [
@@ -616,6 +625,16 @@ def build_edge_pool(host):
     log("EDGE POOL", f"探测完成: 可用 {len(alive)} / 候选 {len(candidates)}")
     for ms, entry in alive:
         log("EDGE POOL", f"  ✓ {entry}  {ms}ms")
+
+    if len(alive) < EDGE_POOL_MIN_KEEP:
+        # 探测是从美国发起的, 判断不了国内连通性, 所以不能把 bestcf(国内实测) 的入口全丢掉
+        log(
+            "EDGE POOL",
+            f"[警告] 探测只保留了 {len(alive)} 个 (< EDGE_POOL_MIN_KEEP={EDGE_POOL_MIN_KEEP}), "
+            f"回退使用 bestcf 原始候选 {len(candidates)} 个",
+        )
+        return list(candidates)
+
     return [entry for _, entry in alive]
 
 
